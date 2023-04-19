@@ -12,19 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple, Type
 
 import flax.linen as nn
 import jax.numpy as jnp
 
-from vit_jax import models_mixer
 from vit_jax import models_resnet
 
 Array = Any
 PRNGKey = Any
 Shape = Tuple[int]
 Dtype = Any
-
 
 class IdentityLayer(nn.Module):
   """Identity layer, convenient for giving a name to an array."""
@@ -33,10 +31,8 @@ class IdentityLayer(nn.Module):
   def __call__(self, x):
     return x
 
-
 class AddPositionEmbs(nn.Module):
-  """Adds (optionally learned) positional embeddings to the inputs.
-
+  """Adds learned positional embeddings to the inputs.
   Attributes:
     posemb_init: positional embedding initializer.
   """
@@ -45,15 +41,9 @@ class AddPositionEmbs(nn.Module):
 
   @nn.compact
   def __call__(self, inputs):
-    """Applies AddPositionEmbs module.
-
-    By default this layer uses a fixed sinusoidal embedding table. If a
-    learned position embedding is desired, pass an initializer to
-    posemb_init.
-
+    """Applies the AddPositionEmbs module.
     Args:
       inputs: Inputs to the layer.
-
     Returns:
       Output tensor with shape `(bs, timesteps, in_dim)`.
     """
@@ -63,7 +53,6 @@ class AddPositionEmbs(nn.Module):
     pos_emb_shape = (1, inputs.shape[1], inputs.shape[2])
     pe = self.param('pos_embedding', self.posemb_init, pos_emb_shape)
     return inputs + pe
-
 
 class MlpBlock(nn.Module):
   """Transformer MLP / feed-forward block."""
@@ -100,10 +89,8 @@ class MlpBlock(nn.Module):
             output, deterministic=deterministic)
     return output
 
-
 class Encoder1DBlock(nn.Module):
   """Transformer encoder layer.
-
   Attributes:
     inputs: input data.
     mlp_dim: dimension of the mlp on top of attention block.
@@ -123,11 +110,9 @@ class Encoder1DBlock(nn.Module):
   @nn.compact
   def __call__(self, inputs, *, deterministic):
     """Applies Encoder1DBlock module.
-
     Args:
       inputs: Inputs to the layer.
       deterministic: Dropout will not be applied when set to true.
-
     Returns:
       output after transformer encoder block.
     """
@@ -154,10 +139,8 @@ class Encoder1DBlock(nn.Module):
 
     return x + y
 
-
 class Encoder(nn.Module):
   """Transformer Model Encoder for sequence to sequence translation.
-
   Attributes:
     num_layers: number of layers
     mlp_dim: dimension of the mlp on top of attention block
@@ -171,25 +154,25 @@ class Encoder(nn.Module):
   num_heads: int
   dropout_rate: float = 0.1
   attention_dropout_rate: float = 0.1
+  add_position_embedding: bool = True
 
   @nn.compact
-  def __call__(self, inputs, *, train):
+  def __call__(self, x, *, train):
     """Applies Transformer model on the inputs.
-
     Args:
-      inputs: Inputs to the layer.
+      x: Inputs to the layer.
       train: Set to `True` when training.
-
     Returns:
       output of a transformer encoder.
     """
-    assert inputs.ndim == 3  # (batch, len, emb)
+    assert x.ndim == 3  # (batch, len, emb)
 
-    x = AddPositionEmbs(
-        posemb_init=nn.initializers.normal(stddev=0.02),  # from BERT.
-        name='posembed_input')(
-            inputs)
-    x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=not train)
+    if self.add_position_embedding:
+      x = AddPositionEmbs(
+          posemb_init=nn.initializers.normal(stddev=0.02),  # from BERT.
+          name='posembed_input')(
+              x)
+      x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=not train)
 
     # Input Encoder
     for lyr in range(self.num_layers):
@@ -204,7 +187,6 @@ class Encoder(nn.Module):
 
     return encoded
 
-
 class VisionTransformer(nn.Module):
   """VisionTransformer."""
 
@@ -215,6 +197,9 @@ class VisionTransformer(nn.Module):
   resnet: Optional[Any] = None
   representation_size: Optional[int] = None
   classifier: str = 'token'
+  head_bias_init: float = 0.
+  encoder: Type[nn.Module] = Encoder
+  model_name: Optional[str] = None
 
   @nn.compact
   def __call__(self, inputs, *, train):
@@ -266,23 +251,24 @@ class VisionTransformer(nn.Module):
     # Here, x is a grid of embeddings.
 
     # (Possibly partial) Transformer.
-    # TODO(andstein) remove "optional"
     if self.transformer is not None:
       n, h, w, c = x.shape
       x = jnp.reshape(x, [n, h * w, c])
 
       # If we want to add a class token, add it here.
-      if self.classifier == 'token':
+      if self.classifier in ['token', 'token_unpooled']:
         cls = self.param('cls', nn.initializers.zeros, (1, 1, c))
         cls = jnp.tile(cls, [n, 1, 1])
         x = jnp.concatenate([cls, x], axis=1)
 
-      x = Encoder(name='Transformer', **self.transformer)(x, train=train)
+      x = self.encoder(name='Transformer', **self.transformer)(x, train=train)
 
     if self.classifier == 'token':
       x = x[:, 0]
     elif self.classifier == 'gap':
       x = jnp.mean(x, axis=list(range(1, x.ndim - 1)))  # (1,) or (1,2)
+    elif self.classifier in ['unpooled', 'token_unpooled']:
+      pass
     else:
       raise ValueError(f'Invalid classifier={self.classifier}')
 
@@ -292,13 +278,13 @@ class VisionTransformer(nn.Module):
     else:
       x = IdentityLayer(name='pre_logits')(x)
 
-    x = nn.Dense(
-        features=self.num_classes,
-        name='head',
-        kernel_init=nn.initializers.zeros)(
-            x)
+    if self.num_classes:
+      x = nn.Dense(
+          features=self.num_classes,
+          name='head',
+          kernel_init=nn.initializers.zeros,
+          bias_init=nn.initializers.constant(self.head_bias_init))(x)
     return x
-
 class VisionTransformer_prelogits(nn.Module):
   """VisionTransformer."""
 
@@ -309,6 +295,9 @@ class VisionTransformer_prelogits(nn.Module):
   resnet: Optional[Any] = None
   representation_size: Optional[int] = None
   classifier: str = 'token'
+  head_bias_init: float = 0.
+  encoder: Type[nn.Module] = Encoder
+  model_name: Optional[str] = None
 
   @nn.compact
   def __call__(self, inputs, *, train):
@@ -395,6 +384,3 @@ class VisionTransformer_prelogits(nn.Module):
             x)
     return prelogits
 
-
-
-MlpMixer = models_mixer.MlpMixer
